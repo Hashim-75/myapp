@@ -5,11 +5,13 @@ on:
     branches: [main]
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
     steps:
       - name: Check out code
         uses: actions/checkout@v4
@@ -17,8 +19,9 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Set lowercase image name
-        run: echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Work out lowercase image name
+        id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to registry
         uses: docker/login-action@v3
@@ -32,17 +35,40 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          tags: ${{ steps.meta.outputs.image }}:${{ github.sha }}
 
-      - name: Update image tag in config repo
-        env:
-          TOKEN: ${{ secrets.CONFIG_REPO_TOKEN }}
+  update-config:
+    needs: build
+    runs-on: ubuntu-latest
+    concurrency:
+      group: update-config
+      cancel-in-progress: false
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - name: Check out config repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/gitops-config
+          token: ${{ secrets.CONFIG_REPO_TOKEN }}
+          path: gitops-config
+
+      - name: Set new image tag
+        working-directory: gitops-config/apps/myapp/overlays/dev
+        run: kustomize edit set image myapp=${IMAGE}:${{ github.sha }}
+
+      - name: Commit and push
+        working-directory: gitops-config
         run: |
-          git clone https://x-access-token:${TOKEN}@github.com/${{ github.repository_owner }}/gitops-config.git
-          cd gitops-config/apps/myapp/overlays/dev
-          kustomize edit set image myapp=${IMAGE}:${{ github.sha }}
-          cd "$GITHUB_WORKSPACE/gitops-config"
-          git config user.name "ci-bot"
-          git config user.email "ci-bot@example.com"
-          git commit -am "Deploy myapp ${{ github.sha }} to dev"
-          git push
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No change to commit"
+            exit 0
+          fi
+          git commit -m "Deploy myapp ${{ github.sha }} to dev"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push && break
+            sleep 3
+          done
